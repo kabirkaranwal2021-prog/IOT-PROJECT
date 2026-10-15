@@ -2,635 +2,248 @@
 #include <LiquidCrystal_I2C.h>
 #include <Servo.h>
 
-// =====================================================
-// PIN DEFINITIONS
-// =====================================================
-
-// EXIT SENSOR
-// TRIG -> D2
-// ECHO -> D3
-const byte EXIT_TRIG = 2;
-const byte EXIT_ECHO = 3;
-
-// SERVO
-// Signal -> D4
+// Pin configuration
+const byte ENTRY_TRIG = 2;
+const byte ENTRY_ECHO = 3;
 const byte SERVO_PIN = 4;
-
-// ENTRY SENSOR
-// TRIG -> D5
-// ECHO -> D6
-const byte ENTRY_TRIG = 5;
-const byte ENTRY_ECHO = 6;
-
-// BUZZER
+const byte EXIT_TRIG = 5;
+const byte EXIT_ECHO = 6;
 const byte BUZZER_PIN = 7;
 
-
-// =====================================================
-// LCD
-// =====================================================
-
+// LCD configuration
 LiquidCrystal_I2C lcd(0x27, 16, 2);
+Servo gate;
 
-
-// =====================================================
-// SERVO
-// =====================================================
-
-Servo barrierServo;
-
-const int CLOSED_ANGLE = 0;
-const int OPEN_ANGLE = 90;
-
-
-// =====================================================
-// PARKING
-// =====================================================
-
+// Parking configuration
 const int TOTAL_SLOTS = 4;
+int occupiedCars = 0;
+int slotsLeft = TOTAL_SLOTS;
 
-int availableSlots = TOTAL_SLOTS;
+// Distance thresholds
+const float DETECTION_DISTANCE = 15.8;
+const float OBJECT_AWAY_DISTANCE = 18.0;
 
+// Gate clearance times
+const unsigned long ENTRY_CLEAR_TIME = 4000;
+const unsigned long EXIT_CLEAR_TIME = 2000;
 
-// =====================================================
-// SENSOR DISTANCE SETTINGS
-// =====================================================
-
-// Object detected at 17 cm or less
-const int DETECTION_DISTANCE = 17;
-
-// Object must move to 25 cm or more
-// before the barrier closes
-const int CLEAR_DISTANCE = 25;
-
-
-// =====================================================
-// GET DISTANCE
-// =====================================================
-
-long getDistance(byte trigPin, byte echoPin) {
-
+// Get ultrasonic distance in centimetres
+float getDistance(byte trigPin, byte echoPin) {
   digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
+  delayMicroseconds(3);
 
   digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
-
   digitalWrite(trigPin, LOW);
 
   unsigned long duration =
-    pulseIn(echoPin, HIGH, 25000);
+      pulseIn(echoPin, HIGH, 25000UL);
 
   if (duration == 0) {
-    return 999;
+    return -1;
   }
 
-  long distance = duration * 0.0343 / 2;
-
-  return distance;
+  return duration * 0.0343 / 2.0;
 }
 
+// Display a message on the LCD
+void showMessage(const char* line1, const char* line2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+}
 
-// =====================================================
-// BUZZER
-// =====================================================
+// Update available parking slots
+void updateLCD() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Slots Left: ");
+  lcd.print(slotsLeft);
 
-void beep() {
+  lcd.setCursor(0, 1);
 
-  tone(BUZZER_PIN, 1000);
+  if (slotsLeft == 0) {
+    lcd.print("PARKING FULL");
+  } else {
+    lcd.print("System Ready");
+  }
+}
 
-  delay(150);
-
+// Entry buzzer
+void entryBeep() {
+  tone(BUZZER_PIN, 700, 100);
+  delay(120);
+  tone(BUZZER_PIN, 1100, 120);
+  delay(130);
   noTone(BUZZER_PIN);
 }
 
-
-// =====================================================
-// OPEN BARRIER SLOWLY
-// =====================================================
-
-void openBarrier() {
-
-  Serial.println("Opening barrier...");
-
-  for (int angle = CLOSED_ANGLE;
-       angle <= OPEN_ANGLE;
-       angle++) {
-
-    barrierServo.write(angle);
-
-    delay(15);
-  }
-
-  Serial.println("Barrier OPEN");
+// Exit buzzer
+void exitBeep() {
+  tone(BUZZER_PIN, 1500, 100);
+  delay(120);
+  tone(BUZZER_PIN, 700, 120);
+  delay(130);
+  noTone(BUZZER_PIN);
 }
 
-
-// =====================================================
-// CLOSE BARRIER SLOWLY
-// =====================================================
-
-void closeBarrier() {
-
-  Serial.println("Closing barrier...");
-
-  for (int angle = OPEN_ANGLE;
-       angle >= CLOSED_ANGLE;
-       angle--) {
-
-    barrierServo.write(angle);
-
-    delay(15);
-  }
-
-  Serial.println("Barrier CLOSED");
+// Warning buzzer
+void warningBeep() {
+  tone(BUZZER_PIN, 500, 250);
+  delay(250);
+  noTone(BUZZER_PIN);
 }
 
+// Open and close gate
+void openGate() {
+  gate.write(90);
+  Serial.println("GATE OPEN");
+}
 
-// =====================================================
-// WAIT UNTIL VEHICLE MOVES AWAY
-// =====================================================
+void closeGate() {
+  gate.write(0);
+  Serial.println("GATE CLOSED");
+}
 
-void waitUntilVehicleLeaves(byte trigPin, byte echoPin) {
+// Wait until the sensor reports a clear path
+// continuously for the required duration.
+void waitUntilObjectAway(
+    byte trigPin,
+    byte echoPin,
+    unsigned long requiredTime) {
 
-  Serial.println("Waiting for vehicle to move away...");
-
-  lcd.clear();
-
-  lcd.setCursor(0, 0);
-  lcd.print("BARRIER OPEN");
-
-  lcd.setCursor(0, 1);
-  lcd.print("MOVE VEHICLE");
-
-  bool vehicleWasDetected = false;
+  unsigned long awayStart = 0;
 
   while (true) {
-
-    long distance =
-      getDistance(trigPin, echoPin);
+    float distance = getDistance(trigPin, echoPin);
 
     Serial.print("Distance: ");
     Serial.print(distance);
     Serial.println(" cm");
 
-
-    // -----------------------------------------------
-    // VEHICLE STILL CLOSE
-    // -----------------------------------------------
-
-    if (distance <= DETECTION_DISTANCE) {
-
-      vehicleWasDetected = true;
-
-      Serial.println("Vehicle/object detected");
-    }
-
-
-    // -----------------------------------------------
-    // VEHICLE MOVED AWAY
-    // -----------------------------------------------
-
-    if (vehicleWasDetected &&
-        distance >= CLEAR_DISTANCE) {
-
-      Serial.println("Vehicle moved away");
-
-      // Wait before confirmation
-      delay(700);
-
-      long confirmDistance =
-        getDistance(trigPin, echoPin);
-
-      // Confirm that object is still away
-      if (confirmDistance >= CLEAR_DISTANCE) {
-
-        Serial.println("Path clear");
-
-        break;
+    if (distance >= OBJECT_AWAY_DISTANCE) {
+      if (awayStart == 0) {
+        awayStart = millis();
       }
+
+      if (millis() - awayStart >= requiredTime) {
+        return;
+      }
+    } else {
+      awayStart = 0;
     }
 
-    delay(200);
+    delay(50);
   }
 }
 
+// Handle vehicle entry
+void handleEntry() {
+  if (slotsLeft <= 0) {
+    showMessage("PARKING FULL", "Entry denied");
+    warningBeep();
+    delay(500);
+    updateLCD();
+    return;
+  }
 
-// =====================================================
-// LCD NORMAL STATUS
-// =====================================================
+  entryBeep();
+  showMessage("ENTRY DETECTED", "Gate opening");
+  openGate();
 
-void showStatus() {
+  waitUntilObjectAway(
+      ENTRY_TRIG, ENTRY_ECHO, ENTRY_CLEAR_TIME);
 
-  lcd.clear();
+  closeGate();
 
-  lcd.setCursor(0, 0);
-  lcd.print("SMART PARKING");
+  occupiedCars++;
+  slotsLeft = TOTAL_SLOTS - occupiedCars;
 
-  lcd.setCursor(0, 1);
-  lcd.print("SLOTS: ");
-
-  lcd.print(availableSlots);
-
-  lcd.print("/");
-
-  lcd.print(TOTAL_SLOTS);
+  showMessage("ENTRY COMPLETE", "Vehicle counted");
+  delay(500);
+  updateLCD();
 }
 
+// Handle vehicle exit
+void handleExit() {
+  if (occupiedCars <= 0) {
+    showMessage("PARKING EMPTY", "No car to exit");
+    warningBeep();
+    delay(500);
+    updateLCD();
+    return;
+  }
 
-// =====================================================
-// LCD ENTRY MESSAGE
-// =====================================================
+  exitBeep();
+  showMessage("EXIT DETECTED", "Gate opening");
+  openGate();
 
-void showEntry() {
+  waitUntilObjectAway(
+      EXIT_TRIG, EXIT_ECHO, EXIT_CLEAR_TIME);
 
-  lcd.clear();
+  closeGate();
 
-  lcd.setCursor(0, 0);
-  lcd.print("CAR ENTERING");
+  occupiedCars--;
+  slotsLeft = TOTAL_SLOTS - occupiedCars;
 
-  lcd.setCursor(0, 1);
-  lcd.print("SLOTS LEFT: ");
-
-  lcd.print(availableSlots);
+  showMessage("EXIT COMPLETE", "Vehicle counted");
+  delay(500);
+  updateLCD();
 }
 
+// Check for a vehicle
+bool vehicleDetected(byte trigPin, byte echoPin) {
+  float distance = getDistance(trigPin, echoPin);
 
-// =====================================================
-// LCD EXIT MESSAGE
-// =====================================================
+  Serial.print("Detection: ");
+  Serial.print(distance);
+  Serial.println(" cm");
 
-void showExit() {
-
-  lcd.clear();
-
-  lcd.setCursor(0, 0);
-  lcd.print("CAR EXITING");
-
-  lcd.setCursor(0, 1);
-  lcd.print("SLOTS NOW: ");
-
-  lcd.print(availableSlots);
+  return distance > 0 &&
+         distance <= DETECTION_DISTANCE;
 }
 
-
-// =====================================================
-// LCD PARKING FULL
-// =====================================================
-
-void showFull() {
-
-  lcd.clear();
-
-  lcd.setCursor(0, 0);
-  lcd.print("PARKING FULL!");
-
-  lcd.setCursor(0, 1);
-  lcd.print("NO SLOT AVAILABLE");
-}
-
-
-// =====================================================
-// SETUP
-// =====================================================
-
+// Arduino initialization
 void setup() {
-
   Serial.begin(9600);
-
-
-  // ---------------------------------------------------
-  // EXIT SENSOR
-  // ---------------------------------------------------
-
-  pinMode(EXIT_TRIG, OUTPUT);
-  pinMode(EXIT_ECHO, INPUT);
-
-
-  // ---------------------------------------------------
-  // ENTRY SENSOR
-  // ---------------------------------------------------
 
   pinMode(ENTRY_TRIG, OUTPUT);
   pinMode(ENTRY_ECHO, INPUT);
 
-
-  // ---------------------------------------------------
-  // BUZZER
-  // ---------------------------------------------------
+  pinMode(EXIT_TRIG, OUTPUT);
+  pinMode(EXIT_ECHO, INPUT);
 
   pinMode(BUZZER_PIN, OUTPUT);
 
+  digitalWrite(ENTRY_TRIG, LOW);
+  digitalWrite(EXIT_TRIG, LOW);
 
-  // ---------------------------------------------------
-  // SERVO
-  // ---------------------------------------------------
-
-  barrierServo.attach(SERVO_PIN);
-
-  barrierServo.write(CLOSED_ANGLE);
-
-
-  // ---------------------------------------------------
-  // LCD
-  // ---------------------------------------------------
+  gate.attach(SERVO_PIN);
+  gate.write(0);
 
   lcd.init();
-
   lcd.backlight();
 
-  lcd.clear();
+  showMessage("SMART PARKING", "System Ready");
+  delay(1000);
+  updateLCD();
 
-  lcd.setCursor(0, 0);
-  lcd.print("SMART PARKING");
-
-  lcd.setCursor(0, 1);
-  lcd.print("SYSTEM READY");
-
-
-  // ---------------------------------------------------
-  // SERIAL INFORMATION
-  // ---------------------------------------------------
-
-  Serial.println();
-  Serial.println("==============================");
-  Serial.println("     SMART PARKING SYSTEM");
-  Serial.println("==============================");
-
-  Serial.println("D2/D3 = EXIT SENSOR");
-  Serial.println("D5/D6 = ENTRY SENSOR");
-  Serial.println("D4    = SERVO");
-  Serial.println("D7    = BUZZER");
-  Serial.println("LCD   = 0x27");
-
-  Serial.print("TOTAL SLOTS = ");
-  Serial.println(TOTAL_SLOTS);
-
-  Serial.print("AVAILABLE = ");
-  Serial.println(availableSlots);
-
-  Serial.println("DETECTION = 17 cm");
-  Serial.println("CLEAR = 25 cm");
-
-  Serial.println("==============================");
-
-
-  delay(1500);
-
-  showStatus();
+  Serial.println("Smart Parking System Ready");
 }
 
-
-// =====================================================
-// MAIN LOOP
-// =====================================================
-
+// Main Arduino loop
 void loop() {
+  if (vehicleDetected(ENTRY_TRIG, ENTRY_ECHO)) {
+    handleEntry();
+    return;
+  }
 
-
-  // ===================================================
-  // READ EXIT SENSOR
-  // D2/D3
-  // ===================================================
-
-  long exitDistance =
-    getDistance(EXIT_TRIG, EXIT_ECHO);
+  if (vehicleDetected(EXIT_TRIG, EXIT_ECHO)) {
+    handleExit();
+    return;
+  }
 
   delay(50);
-
-
-  // ===================================================
-  // READ ENTRY SENSOR
-  // D5/D6
-  // ===================================================
-
-  long entryDistance =
-    getDistance(ENTRY_TRIG, ENTRY_ECHO);
-
-
-  // ===================================================
-  // SERIAL MONITOR
-  // ===================================================
-
-  Serial.print("EXIT D2/D3 = ");
-
-  Serial.print(exitDistance);
-
-  Serial.print(" cm | ENTRY D5/D6 = ");
-
-  Serial.print(entryDistance);
-
-  Serial.print(" cm | SLOTS = ");
-
-  Serial.println(availableSlots);
-
-
-  // ===================================================
-  // ENTRY
-  // D5/D6
-  //
-  // CAR ENTERS
-  // SLOTS DECREASE
-  // ===================================================
-
-  if (entryDistance <= DETECTION_DISTANCE) {
-
-    Serial.println();
-    Serial.println(">>> ENTRY SENSOR DETECTED");
-    Serial.println(">>> CAR ENTERING");
-
-
-    // -------------------------------------------------
-    // CHECK AVAILABLE SLOTS
-    // -------------------------------------------------
-
-    if (availableSlots > 0) {
-
-      // Car enters
-      availableSlots--;
-
-      Serial.println("ENTRY APPROVED");
-
-      Serial.print("SLOTS LEFT = ");
-      Serial.println(availableSlots);
-
-
-      // LCD
-      showEntry();
-
-
-      // Buzzer
-      beep();
-
-
-      // Open barrier
-      openBarrier();
-
-
-      // Wait until car moves away
-      waitUntilVehicleLeaves(
-        ENTRY_TRIG,
-        ENTRY_ECHO
-      );
-
-
-      // Close barrier
-      closeBarrier();
-
-
-      // Show current slots
-      showStatus();
-
-
-      delay(500);
-    }
-
-
-    else {
-
-      // ------------------------------------------------
-      // PARKING FULL
-      // ------------------------------------------------
-
-      Serial.println("ENTRY DENIED");
-
-      Serial.println("PARKING FULL");
-
-
-      showFull();
-
-
-      // Two warning beeps
-      beep();
-
-      delay(250);
-
-      beep();
-
-
-      delay(1500);
-
-      showFull();
-    }
-
-
-    return;
-  }
-
-
-  // ===================================================
-  // EXIT
-  // D2/D3
-  //
-  // CAR LEAVES
-  // SLOTS INCREASE
-  // ===================================================
-
-  if (exitDistance <= DETECTION_DISTANCE) {
-
-    Serial.println();
-    Serial.println(">>> EXIT SENSOR DETECTED");
-    Serial.println(">>> CAR EXITING");
-
-
-    // -------------------------------------------------
-    // CHECK THAT PARKING IS NOT EMPTY
-    // -------------------------------------------------
-
-    if (availableSlots < TOTAL_SLOTS) {
-
-      // Car leaves
-      availableSlots++;
-
-
-      Serial.println("EXIT APPROVED");
-
-      Serial.print("SLOTS NOW = ");
-
-      Serial.println(availableSlots);
-
-
-      // LCD
-      showExit();
-
-
-      // Buzzer
-      beep();
-
-
-      // Open barrier
-      openBarrier();
-
-
-      // Wait until car moves away
-      waitUntilVehicleLeaves(
-        EXIT_TRIG,
-        EXIT_ECHO
-      );
-
-
-      // Close barrier
-      closeBarrier();
-
-
-      // Show current slots
-      showStatus();
-
-
-      delay(500);
-    }
-
-
-    else {
-
-      // ------------------------------------------------
-      // PARKING EMPTY
-      // ------------------------------------------------
-
-      Serial.println("PARKING ALREADY EMPTY");
-
-
-      lcd.clear();
-
-      lcd.setCursor(0, 0);
-      lcd.print("PARKING EMPTY");
-
-      lcd.setCursor(0, 1);
-      lcd.print("NO CAR INSIDE");
-
-
-      delay(1000);
-
-
-      showStatus();
-    }
-
-
-    return;
-  }
-
-
-  // ===================================================
-  // NORMAL DISPLAY
-  // ===================================================
-
-  lcd.setCursor(0, 0);
-
-  lcd.print("SMART PARKING ");
-
-
-  lcd.setCursor(0, 1);
-
-  lcd.print("SLOTS: ");
-
-  lcd.print(availableSlots);
-
-  lcd.print("/");
-
-  lcd.print(TOTAL_SLOTS);
-
-  lcd.print("        ");
-
-
-  delay(100);
-} 
+}
